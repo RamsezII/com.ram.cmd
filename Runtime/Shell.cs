@@ -3,21 +3,22 @@ using System.Collections.Generic;
 using System.CommandLine;
 using System.CommandLine.Completions;
 using System.IO;
-using System.Threading;
-using System.Threading.Tasks;
 
 namespace _CMD_
 {
     public sealed partial class Shell
     {
-        public RootCommand Root { get; }
-        public InvocationConfiguration Configuration { get; }
+        public readonly RootCommand Root;
+        public readonly InvocationConfiguration Configuration;
+        public string WorkingDirectory = Environment.CurrentDirectory;
+        public bool IsExecuting { get; private set; }
 
         //--------------------------------------------------------------------------------------------------------------
 
         public Shell(string description = "", TextWriter output = null, TextWriter error = null)
         {
             Root = new RootCommand(description);
+
             Configuration = new InvocationConfiguration
             {
                 Output = output ?? Console.Out,
@@ -25,6 +26,8 @@ namespace _CMD_
                 EnableDefaultExceptionHandler = false,
                 ProcessTerminationTimeout = null
             };
+
+            Scan();
         }
 
         //--------------------------------------------------------------------------------------------------------------
@@ -38,13 +41,31 @@ namespace _CMD_
             return Root.Parse(text);
         }
 
-        // Use ExecuteAsync for asynchronous actions so the Unity thread is not blocked.
-        public int Execute(string text) => Parse(text).Invoke(Configuration);
+        public int Execute(string text)
+        {
+            if (IsExecuting)
+                throw new InvalidOperationException("This shell is already executing a command.");
 
-        public int ExecuteSync(string text) => ExecuteAsync(text).GetAwaiter().GetResult();
+            IsExecuting = true;
+            try
+            {
+                return Parse(text).Invoke(Configuration);
+            }
+            finally
+            {
+                IsExecuting = false;
+            }
+        }
 
-        public Task<int> ExecuteAsync(string text, CancellationToken cancellationToken = default) => Parse(text).InvokeAsync(Configuration, cancellationToken);
+        public IEnumerable<CompletionItem> GetCompletions(string text, int? position = null) => GetCompletionItems(text, position ?? text?.Length ?? 0);
 
-        public IEnumerable<CompletionItem> GetCompletions(string text, int? position = null) => Parse(text).GetCompletions(position);
+        public void WriteLine(object value) => Configuration.Output.WriteLine(value);
+
+        //--------------------------------------------------------------------------------------------------------------
+
+        public void Clear()
+        {
+            Root.Subcommands.Clear();
+        }
     }
 }
