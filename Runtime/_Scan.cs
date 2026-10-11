@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.CommandLine;
+using System.CommandLine.Completions;
 using System.Linq;
 using System.Reflection;
 using System.Runtime.CompilerServices;
@@ -19,7 +20,11 @@ namespace _CMD_
     }
 
     [AttributeUsage(AttributeTargets.Parameter)]
-    public sealed class CmdArg : Attribute { }
+    public sealed class CmdArg : Attribute
+    {
+        public readonly string[] completions;
+        public CmdArg(params string[] completions) => this.completions = completions ?? Array.Empty<string>();
+    }
 
     [AttributeUsage(AttributeTargets.Parameter)]
     public sealed class CmdOpt : Attribute
@@ -136,6 +141,9 @@ namespace _CMD_
             if (positional)
             {
                 var argument = new Argument<T>(parameter.Name) { Arity = ArgumentArity.ExactlyOne };
+                string[] completions = parameter.GetCustomAttribute<CmdArg>().completions;
+                if (completions.Length > 0)
+                    argument.CompletionSources.Add(_ => completions.Select(value => new CompletionItem(value)));
                 command.Arguments.Add(argument);
                 return parse => parse.GetValue(argument);
             }
