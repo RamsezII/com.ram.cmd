@@ -19,11 +19,18 @@ namespace _CMD_
         internal string Description => Traductable.language._value == Languages.French ? french ?? english ?? "" : english ?? french ?? "";
     }
 
+    public interface ICompletable
+    {
+        IEnumerable<string> GetCompletions();
+    }
+
     [AttributeUsage(AttributeTargets.Parameter)]
     public sealed class CmdArg : Attribute
     {
-        public readonly string[] completions;
+        public readonly string[] completions = Array.Empty<string>();
+        public readonly Type completionType;
         public CmdArg(params string[] completions) => this.completions = completions ?? Array.Empty<string>();
+        public CmdArg(Type completionType) => this.completionType = completionType ?? throw new ArgumentNullException(nameof(completionType));
     }
 
     [AttributeUsage(AttributeTargets.Parameter)]
@@ -141,9 +148,26 @@ namespace _CMD_
             if (positional)
             {
                 var argument = new Argument<T>(parameter.Name) { Arity = ArgumentArity.ExactlyOne };
-                string[] completions = parameter.GetCustomAttribute<CmdArg>().completions;
-                if (completions.Length > 0)
-                    argument.CompletionSources.Add(_ => completions.Select(value => new CompletionItem(value)));
+                var metadata = parameter.GetCustomAttribute<CmdArg>();
+                Func<IEnumerable<string>> complete = null;
+                if (metadata.completionType != null)
+                {
+                    Type type = metadata.completionType;
+                    if (type.IsEnum)
+                        complete = () => Enum.GetNames(type);
+                    else
+                    {
+                        if (!typeof(ICompletable).IsAssignableFrom(type) || type.IsAbstract || type.ContainsGenericParameters)
+                            throw new InvalidOperationException($"Completion type for {command.Name}.{parameter.Name} must be an enum or a concrete ICompletable type.");
+                        // Keep the provider for this shell; read its current suggestions on every request.
+                        var provider = (ICompletable)Activator.CreateInstance(type, nonPublic: true);
+                        complete = provider.GetCompletions;
+                    }
+                }
+                else if (metadata.completions.Length > 0)
+                    complete = () => metadata.completions;
+                if (complete != null)
+                    argument.CompletionSources.Add(_ => complete().Select(value => new CompletionItem(value)));
                 command.Arguments.Add(argument);
                 return parse => parse.GetValue(argument);
             }

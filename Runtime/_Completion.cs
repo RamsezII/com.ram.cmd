@@ -30,9 +30,20 @@ namespace _CMD_
             if (cursor < 0 || cursor > text.Length)
                 throw new ArgumentOutOfRangeException(nameof(cursor));
 
+            string prefix = text[..cursor];
+            char quote = '\0';
+            foreach (char c in prefix)
+            {
+                if (c == quote)
+                    quote = '\0';
+                else if (quote == '\0' && (c == '"' || c == '\''))
+                    quote = c;
+            }
+
+            // Close an unfinished quote so the parser keeps the value being completed.
             // Using parsed tokens avoids raw-text completion failures with quotes and inline option values.
-            var arguments = Parse(text[..cursor]).Tokens.Select(token => token.Value).ToList();
-            if (cursor > 0 && char.IsWhiteSpace(text[cursor - 1]))
+            var arguments = Parse(quote == '\0' ? prefix : prefix + quote).Tokens.Select(token => token.Value).ToList();
+            if (quote == '\0' && cursor > 0 && char.IsWhiteSpace(text[cursor - 1]))
                 arguments.Add(string.Empty);
 
             var parse = Root.Parse(arguments.ToArray());
