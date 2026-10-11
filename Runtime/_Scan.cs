@@ -3,12 +3,14 @@ using System.Collections.Generic;
 using System.CommandLine;
 using System.Linq;
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using System.Runtime.ExceptionServices;
+using System.Threading.Tasks;
 using _ARK_;
 
 namespace _CMD_
 {
-    [AttributeUsage(AttributeTargets.Class, Inherited = false)]
+    [AttributeUsage(AttributeTargets.Method, Inherited = false)]
     public sealed class Cmd : Attribute
     {
         public string french, english;
@@ -16,17 +18,17 @@ namespace _CMD_
         internal string Description => Traductable.language._value == Languages.French ? french ?? english ?? "" : english ?? french ?? "";
     }
 
-    [AttributeUsage(AttributeTargets.Field)]
+    [AttributeUsage(AttributeTargets.Parameter)]
     public sealed class CmdArg : Attribute { }
 
-    [AttributeUsage(AttributeTargets.Field)]
+    [AttributeUsage(AttributeTargets.Parameter)]
     public sealed class CmdOpt : Attribute
     {
         public readonly char shortName;
         public CmdOpt(char shortName = '\0') => this.shortName = shortName;
     }
 
-    [AttributeUsage(AttributeTargets.Field)]
+    [AttributeUsage(AttributeTargets.Parameter)]
     public sealed class CmdFlag : Attribute
     {
         public readonly char shortName;
@@ -58,64 +60,67 @@ namespace _CMD_
 
                 foreach (Type type in types)
                 {
-                    if (type != null && type.IsClass && !type.IsAbstract && !type.ContainsGenericParameters && type.IsDefined(typeof(Cmd), false))
-                        AddCommand(Activator.CreateInstance(type, nonPublic: true));
+                    if (type == null || type.ContainsGenericParameters)
+                        continue;
+                    foreach (MethodInfo method in type.GetMethods(BindingFlags.Static | BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly))
+                        if (method.IsDefined(typeof(Cmd), false))
+                            AddCommand(method);
                 }
             }
         }
 
-        // Also accepts an existing instance when registering a command explicitly.
-        public void AddCommand(object instance)
+        public void AddCommand(Delegate action)
         {
-            if (instance == null)
-                throw new ArgumentNullException(nameof(instance));
+            if (action == null)
+                throw new ArgumentNullException(nameof(action));
+            AddCommand(action.Method);
+        }
 
-            Type type = instance.GetType();
-            var metadata = type.GetCustomAttribute<Cmd>();
+        void AddCommand(MethodInfo method)
+        {
+            var metadata = method.GetCustomAttribute<Cmd>();
             if (metadata == null)
-                throw new ArgumentException($"{type.FullName} must have a [Cmd] attribute.", nameof(instance));
+                throw new ArgumentException($"{method.Name} must have a [Cmd] attribute.", nameof(method));
+            if (!method.IsStatic || method.ContainsGenericParameters)
+                throw new InvalidOperationException($"{method.DeclaringType.FullName}.{method.Name} must be a non-generic static method.");
+            Type returnType = method.ReturnType;
+            bool returnsTask = typeof(Task).IsAssignableFrom(returnType);
+            bool returnsValueTask = returnType == typeof(ValueTask) || (returnType.IsGenericType && returnType.GetGenericTypeDefinition() == typeof(ValueTask<>));
+            if (method.IsDefined(typeof(AsyncStateMachineAttribute), false) || returnsTask || returnsValueTask)
+                throw new InvalidOperationException($"{method.Name} must execute synchronously.");
 
-            string name = type.Name.StartsWith("Cmd", StringComparison.Ordinal) ? type.Name.Substring(3) : type.Name;
-            if (name.Length == 0 || Root.Subcommands.Any(command => command.Name == name || command.Aliases.Contains(name)))
-                throw new InvalidOperationException($"Invalid or duplicate command name: '{name}'.");
+            if (Root.Subcommands.Any(command => command.Name == method.Name || command.Aliases.Contains(method.Name)))
+                throw new InvalidOperationException($"Duplicate command name: '{method.Name}'.");
 
-            MethodInfo[] methods = type.GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic).Where(method => method.Name == "Execute" && !method.ContainsGenericParameters).ToArray();
-            MethodInfo execute = methods.FirstOrDefault(method => method.GetParameters().Length == 0);
-            execute ??= methods.FirstOrDefault(method => method.GetParameters().Length == 1 && method.GetParameters()[0].ParameterType == typeof(Shell));
-            if (execute == null || (execute.ReturnType != typeof(void) && execute.ReturnType != typeof(int)))
-                throw new InvalidOperationException($"{type.FullName} needs an Execute() or Execute(Shell) method returning void or int.");
+            var command = new Command(method.Name, metadata.Description);
+            var bindings = new List<Func<ParseResult, object>>();
+            MethodInfo createBinding = typeof(Shell).GetMethod(nameof(CreateParameterBinding), BindingFlags.Instance | BindingFlags.NonPublic);
 
-            var command = new Command(name, metadata.Description);
-            var bindings = new List<Action<ParseResult>>();
-            MethodInfo createBinding = typeof(Shell).GetMethod(nameof(CreateFieldBinding), BindingFlags.Instance | BindingFlags.NonPublic);
-
-            // Roslyn emits field metadata in declaration order, including multiple fields on the same line.
-            foreach (FieldInfo field in type.GetFields(BindingFlags.Instance | BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly).OrderBy(field => field.MetadataToken))
+            foreach (ParameterInfo parameter in method.GetParameters())
             {
-                var argument = field.GetCustomAttribute<CmdArg>();
-                var option = field.GetCustomAttribute<CmdOpt>();
-                var flag = field.GetCustomAttribute<CmdFlag>();
+                var argument = parameter.GetCustomAttribute<CmdArg>();
+                var option = parameter.GetCustomAttribute<CmdOpt>();
+                var flag = parameter.GetCustomAttribute<CmdFlag>();
                 int attributes = (argument != null ? 1 : 0) + (option != null ? 1 : 0) + (flag != null ? 1 : 0);
-                if (attributes == 0)
-                    continue;
-                if (attributes != 1 || field.IsStatic || field.IsInitOnly || field.IsLiteral)
-                    throw new InvalidOperationException($"{type.FullName}.{field.Name} needs one command field attribute and must be a writable instance field.");
-                if (flag != null && field.FieldType != typeof(bool))
-                    throw new InvalidOperationException($"[CmdFlag] requires a bool field: {type.FullName}.{field.Name}.");
+                if (attributes != 1 || parameter.ParameterType.IsByRef)
+                    throw new InvalidOperationException($"{method.Name}.{parameter.Name} needs one command parameter attribute and cannot be passed by reference.");
+                if (flag != null && parameter.ParameterType != typeof(bool))
+                    throw new InvalidOperationException($"[CmdFlag] requires a bool parameter: {method.Name}.{parameter.Name}.");
 
-                var binding = (Action<ParseResult>)createBinding.MakeGenericMethod(field.FieldType).Invoke(this, new object[] { command, instance, field, argument != null, option?.shortName ?? flag?.shortName ?? '\0', flag != null });
+                var binding = (Func<ParseResult, object>)createBinding.MakeGenericMethod(parameter.ParameterType).Invoke(this, new object[] { command, parameter, argument != null, option?.shortName ?? flag?.shortName ?? '\0', flag != null });
                 bindings.Add(binding);
             }
 
-            object[] parameters = execute.GetParameters().Length == 0 ? null : new object[] { this };
             command.SetAction(parse =>
             {
-                foreach (Action<ParseResult> bind in bindings)
-                    bind(parse);
-
                 try
                 {
-                    return execute.Invoke(instance, parameters) is int exitCode ? exitCode : 0;
+                    object result = method.Invoke(null, bindings.Select(bind => bind(parse)).ToArray());
+                    if (returnType == typeof(int))
+                        return (int)result;
+                    if (result != null)
+                        Configuration.Output.WriteLine(result);
+                    return 0;
                 }
                 catch (TargetInvocationException exception) when (exception.InnerException != null)
                 {
@@ -126,18 +131,17 @@ namespace _CMD_
             Root.Subcommands.Add(command);
         }
 
-        Action<ParseResult> CreateFieldBinding<T>(Command command, object instance, FieldInfo field, bool positional, char shortName, bool flag)
+        Func<ParseResult, object> CreateParameterBinding<T>(Command command, ParameterInfo parameter, bool positional, char shortName, bool flag)
         {
             if (positional)
             {
-                var argument = new Argument<T>(field.Name) { Arity = ArgumentArity.ExactlyOne };
+                var argument = new Argument<T>(parameter.Name) { Arity = ArgumentArity.ExactlyOne };
                 command.Arguments.Add(argument);
-                return parse => field.SetValue(instance, parse.GetValue(argument));
+                return parse => parse.GetValue(argument);
             }
 
-            // Reset absent options to their initial value, and absent flags to false.
-            T initialValue = flag ? default : (T)field.GetValue(instance);
-            var option = new Option<T>("--" + field.Name)
+            T initialValue = !flag && parameter.HasDefaultValue ? (T)parameter.DefaultValue : default;
+            var option = new Option<T>("--" + parameter.Name)
             {
                 Arity = flag ? ArgumentArity.Zero : ArgumentArity.ExactlyOne,
                 DefaultValueFactory = _ => initialValue,
@@ -152,7 +156,7 @@ namespace _CMD_
                 throw new InvalidOperationException($"Duplicate option name or alias in command '{command.Name}': {option.Name}.");
 
             command.Options.Add(option);
-            return parse => field.SetValue(instance, parse.GetValue(option));
+            return parse => parse.GetValue(option);
         }
     }
 }
